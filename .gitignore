@@ -147,3 +147,10 @@ docs-generated/
 
 # mergetoolfiles
 *.orig
+
+# additional staff
+Examples/
+Plotting/
+misc/PyGRDECL/
+misc/pylops/
+.gitignore
