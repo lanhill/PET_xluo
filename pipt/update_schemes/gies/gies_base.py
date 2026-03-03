@@ -3,6 +3,10 @@ EnRML type schemes
 """
 # External imports
 import pipt.misc_tools.analysis_tools as at
+import pipt.misc_tools.extract_tools as extract
+import pipt.misc_tools.ensemble_tools as entools
+import pipt.misc_tools.data_tools as dtools
+
 from geostat.decomp import Cholesky
 from pipt.loop.ensemble import Ensemble
 from pipt.update_schemes.update_methods_ns.subspace_update import subspace_update
@@ -13,9 +17,24 @@ import pkgutil
 import inspect
 import numpy as np
 import copy as cp
-from scipy.linalg import cholesky, solve
+from scipy.linalg import cholesky, solve, inv, lu_solve, lu_factor
+
+import importlib.util
+
+# List all available packages in the namespace package
+# Import those that are present
+import pipt.update_schemes.gies as ns_pkg
+tot_ns_pkg = []
+# extract all class methods from namespace
+for finder, name, ispkg in pkgutil.walk_packages(ns_pkg.__path__):
+    if 'update' in name:
+        spec = finder.find_spec(name)
+        _module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_module)
+        tot_ns_pkg.extend(inspect.getmembers(_module, inspect.isclass))
 
 # Internal imports
+from pipt.misc_tools.analysis_tools import aug_state
 
 
 class GIESMixIn(Ensemble):
@@ -27,28 +46,39 @@ class GIESMixIn(Ensemble):
                     ensemble smoother." Computational Geosciences 26.3 (2022): 571-594.
     """
 
-    def __init__(self, keys_da, keys_fwd, sim):
+    def __init__(self, keys_da, keys_en, sim):
         """
         The class is initialized by passing the PIPT init. file upwards in the hierarchy to be read and parsed in
         `pipt.input_output.pipt_init.ReadInitFile`.
-
-        Parameters
-        ----------
-        init_file: str
-            PIPT init. file containing info. to run the inversion algorithm
         """
         # Pass the init_file upwards in the hierarchy
         super().__init__(keys_da, keys_fwd, sim)
 
         if self.restart is False:
             # Save prior state in separate variable
-            self.prior_state = cp.deepcopy(self.state)
+            #self.prior_state = cp.deepcopy(self.state)
+            self.prior_enX = cp.deepcopy(self.enX) # not sure if this is wise!
 
-            # Extract parameters like conv. tol. and damping param. from ITERATION keyword in DATAASSIM
-            self._ext_iter_param()
+            # Set parameters needed for LM-EnRML
+            options = self.keys_da['iteration']
+            if isinstance(options, list):
+                options = extract.list_to_dict(options)
 
-            # Within variables
+            self.data_misfit_tol = options.get('data_misfit_tol', 0.01) # default value corresping to 1%
+            self.trunc_energy = options.get('energy', 0.95)
+            self.step_tol = options.get('step_tol', 0.01)
+            self.lam = options.get('lambda', 1.0)
+            self.gamma = options.get('lambda_factor', 2.0)
+            self.iteration = 0
+
+            # Ensure that it is given as percentage
+            if self.trunc_energy > 1:
+                self.trunc_energy /= 100.
+
+            # Initalize some variables
             self.prev_data_misfit = None  # Data misfit at previous iteration
+
+            # Load ACTNUM if given
             if 'actnum' in self.keys_da.keys():
                 try:
                     self.actnum = np.load(self.keys_da['actnum'])['actnum']
@@ -56,77 +86,86 @@ class GIESMixIn(Ensemble):
                     print('ACTNUM file cannot be loaded!')
             else:
                 self.actnum = None
-            # At the moment, the iterative loop is threated as an iterative smoother and thus we check if assim. indices
+
+            # At the moment, the iterative loop is treated as an iterative smoother and thus we check if assim. indices
             # are given as in the Simultaneous loop.
             self.check_assimindex_simultaneous()
-            # define the assimilation index
             self.assim_index = [self.keys_da['obsname'], self.keys_da['assimindex'][0]]
-            # define the list of states
-            self.list_states = list(self.state.keys())
+
             # define the list of datatypes
-            self.list_datatypes, self.list_act_datatypes = at.get_list_data_types(
-                self.obs_data, self.assim_index)
+            self.list_datatypes, self.list_act_datatypes = at.get_list_data_types(self.obs_data, self.assim_index)
+
             # Get the perturbed observations and observation scaling
             self.data_random_state = cp.deepcopy(np.random.get_state())
-            self._ext_obs()
+            self.vecObs, self.enObs = self.set_observations()
+
             # Get state scaling and svd of scaled prior
             self._ext_scaling()
-            self.current_state = cp.deepcopy(self.state)
 
     def calc_analysis(self):
         """
         Calculate the update step in LM-EnRML, which is just the Levenberg-Marquardt update algorithm with
         the sensitivity matrix approximated by the ensemble.
         """
-
-        # reformat predicted data
-        _, self.aug_pred_data = at.aug_obs_pred_data(self.obs_data, self.pred_data, self.assim_index,
-                                                     self.list_datatypes)
+        # Get Ensemble of predicted data
+        _, self.enPred = at.aug_obs_pred_data(
+            self.obs_data,
+            self.pred_data,
+            self.assim_index,
+            self.list_datatypes
+        )
 
         if self.iteration == 1:  # first iteration
+
+            # Calculate the prior data misfit
             data_misfit = at.calc_objectivefun(
-                self.real_obs_data, self.aug_pred_data, self.cov_data)
+                pert_obs=self.enObs,
+                pred_data=self.enPred,
+                Cd=self.cov_data
+            )
 
             # Store the (mean) data misfit (also for conv. check)
             self.data_misfit = np.mean(data_misfit)
             self.prior_data_misfit = np.mean(data_misfit)
             self.data_misfit_std = np.std(data_misfit)
 
-            #self.logger.info(
-            #    f'Prior run complete with data misfit: {self.prior_data_misfit:0.1f}. Lambda for initial analysis: {self.lam}')
+            # Log initial data misfit
+            self.log_update(success=True, prior_run=True)
 
         if 'localanalysis' in self.keys_da:
             self.local_analysis_update()
         else:
-            # Mean pred_data and perturbation matrix with scaling
-            if len(self.scale_data.shape) == 1:
-                #self.pert_preddata = np.dot(np.expand_dims(self.scale_data ** (-1), axis=1),
-                #                            np.ones((1, self.ne))) * np.dot(self.aug_pred_data[:, 0:self.ne], self.proj)
-                self.pert_preddata = np.dot(np.expand_dims(self.scale_data ** (-1), axis=1),
-                                            np.ones((1, self.ne))) * (self.aug_pred_data[:, 0:self.ne] - self.aug_pred_data[:, self.ne, None])
+            # Check for adjoint
+            if hasattr(self, 'adjoints'):
+                enAdj = dtools.combine_ensemble_dataframes(self.adjoints)
+                enAdj = dtools.dataframe_to_matrix(enAdj)  # Shape (nd, ne, nx)
             else:
-                #self.pert_preddata = solve(
-                #    self.scale_data, np.dot(self.aug_pred_data[:, 0:self.ne], self.proj))
-                self.pert_preddata = solve(
-                    self.scale_data, self.aug_pred_data[:, 0:self.ne] - self.aug_pred_data[:, self.ne, None])
+                enAdj = None
 
-            aug_state = at.aug_state(self.current_state, self.list_states)
-            self.update()  # run ordinary analysis
+            # Perform the update
+            self.update(
+                enX=self.enX,
+                enY=self.enPred,
+                enE=self.enObs,
+                # kwargs
+                prior=self.prior_enX,
+                enAdj=enAdj
+            )
+
+            # Update the state ensemble and weights
             if hasattr(self, 'step'):
-                aug_state_upd = aug_state + self.step
+                self.enX_temp = self.enX + self.step
             if hasattr(self, 'w_step'):
                 self.W = self.current_W + self.w_step
-                aug_prior_state = at.aug_state(self.prior_state, self.list_states)
-                aug_state_upd = np.dot(aug_prior_state, (np.eye(
-                    self.ne) + self.W / np.sqrt(self.ne - 1)))
+                self.enX_temp = np.dot(self.prior_enX, (np.eye(self.ne) + self.W / np.sqrt(self.ne - 1)))
 
-            # Extract updated state variables from aug_update
-            self.state = at.update_state(aug_state_upd, self.state, self.list_states)
-            self.state = at.limits(self.state, self.prior_info)
+            # Ensure limits are respected
+            limits = {key: self.prior_info[key].get('limits', (None, None)) for key in self.idX.keys()}
+            self.enX_temp = entools.clip_matrix(self.enX_temp, limits, self.idX)
 
     def check_convergence(self):
         """
-        Check if LM-EnRML have converged based on evaluation of change sizes of objective function, state and damping
+        Check if GIES has converged based on evaluation of change sizes of objective function, state and damping
         parameter. 
 
         Returns
@@ -138,8 +177,14 @@ class GIESMixIn(Ensemble):
             met
         """
 
-        _, pred_data = at.aug_obs_pred_data(self.obs_data, self.pred_data, self.assim_index,
-                                            self.list_datatypes)
+        # Get Ensemble of predicted data
+        _, enPred = at.aug_obs_pred_data(
+            self.obs_data,
+            self.pred_data,
+            self.assim_index,
+            self.list_datatypes
+        )
+
         # Initialize the initial success value
         success = False
 
@@ -151,7 +196,7 @@ class GIESMixIn(Ensemble):
         # mat_obs = np.dot(obs_data_vector.reshape((len(obs_data_vector),1)), np.ones((1, self.ne))) # use the perturbed
         # data instead.
 
-        data_misfit = at.calc_objectivefun(self.real_obs_data, pred_data, self.cov_data)
+        data_misfit = at.calc_objectivefun(self.enObs, enPred, self.cov_data)
 
         self.data_misfit = np.mean(data_misfit)
         self.data_misfit_std = np.std(data_misfit)
@@ -205,7 +250,13 @@ class GIESMixIn(Ensemble):
                         self.lam = self.lam / self.gamma
 
                 success = True
+
                 self.current_state = cp.deepcopy(self.state)
+
+                # Update state ensemble
+                self.enX = cp.deepcopy(self.enX_temp)
+                self.enX_temp = None
+
                 if hasattr(self, 'W'):
                     self.current_W = cp.deepcopy(self.W)
 
@@ -222,24 +273,37 @@ class GIESMixIn(Ensemble):
                              f'STD value reduced by {100 * (1 - (self.data_misfit_std / self.prev_data_misfit_std)):.2f}%'
                              '|'
                              'Lamba for next iteration:' f'{self.lam:.2e}>')
-            if success:
-                #self.logger.info(f'Successfull iteration number {self.iteration}! Objective function reduced from '
-                #                 f'{self.prev_data_misfit:0.1f} to {self.data_misfit:0.1f}. New Lamba for next analysis: '
-                #                 f'{self.lam}')
-                pass
 
-                # self.prev_data_misfit = self.data_misfit
-                # self.prev_data_misfit_std = self.data_misfit_std
-            else:
-                #self.logger.info(f'Failed iteration number {self.iteration}! Objective function increased from '
-                #                 f'{self.prev_data_misfit:0.1f} to {self.data_misfit:0.1f}. New Lamba for repeated analysis: '
-                #                 f'{self.lam}')
+            # Log update results
+            self.log_update(success=success)
+
+            if not success:
                 # Reset the objective function after report
                 self.data_misfit = self.prev_data_misfit
                 self.data_misfit_std = self.prev_data_misfit_std
 
             # Return conv = False, why_stop var.
             return False, success, why_stop
+
+    def log_update(self, success, prior_run=False):
+        '''
+        Log the update results in a formatted table.
+        '''
+        log_data = {
+            "Iteration": f'{0 if prior_run else self.iteration}',
+            "Status": "Success" if (prior_run or success) else "Failed",
+            "Data Misfit": self.data_misfit,
+            "λ": self.lam
+        }
+        if not prior_run:
+            if success:
+                log_data["Reduction (%)"] = 100 * (1 - self.data_misfit / self.prev_data_misfit)
+            else:
+                log_data["Increase (%)"] = 100 * (self.data_misfit / self.prev_data_misfit - 1)
+        else:
+            log_data["Reduction (%)"] = 'N/A'
+
+        self.logger(**log_data)
 
     def _ext_iter_param(self):
         """
