@@ -147,6 +147,10 @@ docs-generated/
 
 # mergetoolfiles
 *.orig
+/pipt/misc_tools/levelset.py
+/pipt/misc_tools/coordtrans.py
+/pipt/misc_tools/heaviside_dirac.py
+/pipt/misc_tools/levelset_tools.py
 
 # additional staff
 Examples/
