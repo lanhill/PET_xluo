@@ -104,7 +104,7 @@ class rlmmac_update():
                     # Need to double check if scaled_delta_data is normalized by a square root of observation error Cov
                     self.step =  ( self.tapering_mtx * (pert_state @ X) ) @ scaled_delta_data
                 else:
-                    self.step = self.localization.auto_ada_loc(self.state_scaling[:, None] * pert_state,
+                    self.step, _ = self.localization.auto_ada_loc(self.state_scaling[:, None] * pert_state,
                                                                np.dot(X, scaled_delta_data),
                                                                self.list_states,
                                                                **{'prior_info': self.prior_info})
