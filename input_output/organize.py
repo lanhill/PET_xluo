@@ -88,7 +88,7 @@ class Organize_input():
                     for rows in reader:  # Rows is a list of values in the csv file
                         csv_data = [None] * len(rows)
                         for ind, col in enumerate(rows):
-                            csv_data[ind] = int(float(col))
+                            csv_data[ind] = float(col)
                         true_prim.extend(csv_data)
             self.keys_pr['truedataindex'] = true_prim
 
@@ -102,7 +102,7 @@ class Organize_input():
                         csv_data = [None] * len(rows)
                         for ind, col in enumerate(rows):
                             try:
-                                csv_data[ind] = int(float(col))
+                                csv_data[ind] = float(col)
                             except ValueError:
                                 csv_data[ind] = dt.datetime.strptime(
                                     col, '%Y-%m-%d %H:%M:%S')

@@ -83,6 +83,9 @@ class localization():
                 init_local['nstd'] = parsed_info['autoadaloc']
                 if 'type' in parsed_info:
                     init_local['type'] = parsed_info['type']
+                #XLUO: added the "init_ens_only" option (only using the initial ensemble to contruct the tapering matrix)
+                if 'init_ens_only' in parsed_info:
+                    init_local['init_ens_only'] = (parsed_info['init_ens_only'].lower() == 'yes')
             elif 'localanalysis' in parsed_info:
                 init_local = {'localanalysis': True}
                 if 'type' in parsed_info:
@@ -421,10 +424,43 @@ class localization():
         else:
             prior_info = {key: None for key in curr_param}
 
-        step = []
+        # XLUO: I added this option to ask "auto_ada_loc" to only output "tapering_mtx"
+        # this will allow "auto_ada_loc" to compute the tapering matrix using different ideas,
+        # in addition to the original one in PIPT that projects data onto an ensemble subspace
+        if 'not_cal_step' in kwargs:
+            not_cal_step = kwargs['not_cal_step']
+        else:
+            not_cal_step = False
+        #step = []
 
         ne = pert_state.shape[1]
         rp_index = np.random.permutation(ne)
+
+        # XLUO:Occasionally, a random permutation may still keep some of the positions of ensemble members
+        # In this case, a further change of the kept positions can resolve this problem
+        original_idx = np.array(list(range(ne))) # range -> list -> np array
+        unchanged_post_idx  = np.where(original_idx == rp_index)[0]
+
+        # XLUO: If at least two positions are unchanged, then shift the unchanged position indices to the left
+        # (also Ok to shift to the right).
+        # If only one position are unchanged, then exchange the index with another picked position
+        if len(unchanged_post_idx) > 1:
+            # change the position index of "unchanged_post_idx" so that unchanged indice will become changed
+            new_idx = [ i for i in unchanged_post_idx[1:]] # left-shift the sequence unchanged_post_idx[1:]
+            new_idx.append(unchanged_post_idx[0])  # add unchanged_post_idx[0] to the end of new_indx
+            tmp_idx = rp_index[new_idx]
+            for i in range(len(unchanged_post_idx)):
+                rp_index[unchanged_post_idx[i]] = tmp_idx[i]
+
+        if len(unchanged_post_idx) == 1:
+            if unchanged_post_idx[0] < (ne - 1):
+                pick_post_idx = ne -1
+            else:
+                pick_post_idx = 0
+            # exchange index
+            rp_index[unchanged_post_idx[0]] = pick_post_idx
+            rp_index[pick_post_idx] = unchanged_post_idx[0]
+
         shuffled_ensemble = pert_state[:, rp_index]
         corr_mtx = self.get_corr_mtx(pert_state, proj_pred_data)
         corr_mtx_shuffled = self.get_corr_mtx(shuffled_ensemble, proj_pred_data)
@@ -447,9 +483,13 @@ class localization():
                 corr_mtx[prop_index, :], corr_mtx_shuffled[prop_index, :])
             tapering_matrix[prop_index, :] = current_tapering
             count += num_active
-        step = np.dot(np.multiply(tapering_matrix, pert_state), proj_pred_data)
 
-        return step
+        if not_cal_step:
+            step = None
+        else:
+            step = np.dot(np.multiply(tapering_matrix, pert_state), proj_pred_data)
+
+        return step, tapering_matrix
 
     def tapering_function(self, cf, cf_s):
 
@@ -462,12 +502,14 @@ class localization():
         for i in range(cf.shape[1]):
             current_cf = cf[:, i]
             est_noise_std = np.median(np.absolute(cf_s[:, i]), axis=0) / 0.6745
+
             if 'threshold' in self.loc_info and self.loc_info['threshold'] == 'universal':
                 cutoff_point = np.sqrt(2*np.log(np.prod(current_cf.shape))) * est_noise_std
             elif 'threshold' in self.loc_info and self.loc_info['threshold'] == 'fixed':
                 cutoff_point = nstd
             else:
                 cutoff_point = nstd * est_noise_std
+
             if 'type' in self.loc_info and self.loc_info['type'] == 'soft':
                 current_tc = self.rational_function(1-np.absolute(current_cf),
                                                     1 - cutoff_point)

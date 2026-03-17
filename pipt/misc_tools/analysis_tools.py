@@ -1238,7 +1238,7 @@ def aug_state(state, list_state, cell_index=None):
 def calc_scaling(enX, idX, prior_info):
     """
     Form the scaling to be used in svd related algoritms. Scaling consist of standard deviation for each `STATICVAR`
-    It is important that this is formed in the same manner as the augmentet state vector is formed. Hence, with the same
+    It is important that this is formed in the same manner as the augmented state vector is formed. Hence, with the same
     list of states.
 
     Parameters

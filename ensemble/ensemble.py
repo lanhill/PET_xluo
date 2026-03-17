@@ -142,20 +142,19 @@ class Ensemble:
 
             else:
                 # State variable imported as a Numpy save file
-                tmp_load = np.load(self.keys_en['importstaticvar'], allow_pickle=True)
+                with np.load(self.keys_en['importstaticvar'], allow_pickle=True) as tmp_load:
+                    # We assume that the user has saved the state dict. as **state (effectively saved all keys in state
+                    # individually).
+                    for key in self.keys_en['staticvar']:
+                        if self.enX is None:
+                            self.enX = tmp_load[key]
+                            self.ne = self.enX.shape[1]
+                        else:
+                            assert self.ne == tmp_load[key].shape[1], 'Ensemble size of imported state variables do not match!'
+                            self.enX = np.vstack((self.enX, tmp_load[key]))
 
-                # We assume that the user has saved the state dict. as **state (effectively saved all keys in state
-                # individually).
-                for key in self.keys_en['staticvar']:
-                    if self.enX is None:
-                        self.enX = tmp_load[key]
-                        self.ne = self.enX.shape[1]
-                    else:
-                        assert self.ne == tmp_load[key].shape[1], 'Ensemble size of imported state variables do not match!'
-                        self.enX = np.vstack((self.enX, tmp_load[key]))
-
-                    # fill in indices
-                    self.idX[key] = (self.enX.shape[0] - tmp_load[key].shape[0], self.enX.shape[0])
+                        # fill in indices
+                        self.idX[key] = (self.enX.shape[0] - tmp_load[key].shape[0], self.enX.shape[0])
                 
                 self.list_states = list(self.keys_en['staticvar'])
 
@@ -246,7 +245,13 @@ class Ensemble:
             # If we have several models (num_models) but only one state input
             if one_state and self.ne > 1:
                 enX = np.tile(enX, (1, self.ne))
-            
+
+            # For RLM-MAC (or other GIES algorithm), one needs to simulate the mean
+            # reservoir model
+            if 'gies' in self.keys_en['daalg']:
+                enX_mean = np.mean(enX, axis=1)
+                enX = np.concatenate((enX, enX_mean[:, None]), axis=1)
+
             # Convert ensemble matrix to list of dictionaries
             enX = entools.matrix_to_list(enX, self.idX)
                 
@@ -255,27 +260,57 @@ class Ensemble:
                     enX[n]['aux_input'] = self.aux_input[n]
 
             ######################################################################################################################
-            # No parralelization
-            if nparallel==1:
-                en_pred = []
-                pbar = tqdm(enumerate(enX), total=self.ne, **progbar_settings)
-                for member_index, state in pbar:
-                    en_pred.append(deepcopy(self.sim.run_fwd_sim(state, member_index)))
-            
-            # Parallelization on HPC using SLURM
-            elif self.sim.input_dict.get('hpc', False): # Run prediction in parallel on hpc
-                en_pred = self.run_on_HPC(enX, batch_size=nparallel)
+            if 'debug_mode' in self.sim.input_dict:
+                assert isinstance(self.sim.input_dict['debug_mode'], list), "Error with the field of 'DEBUG_MODE' "
+                debug_cfg = dict()
+                for item in self.sim.input_dict['debug_mode']:  # if sim.input_dict['debug_mode'] contains a number of list items
+                    info_str = item[0] if isinstance(item, list) else item  # extract information in string
 
-            # Parallelization on local machine using p_map      
+                    # In the debug mode, when 'avoid_ens_run' (boolean) = True, then we avoid running an initial ensemble
+                    # of reservoir simulations. Instead, we load an ensemble of simulated results "en_pred" from the file
+                    # 'test_init_en_pred.npz', which helps save the time of simualtion in the debug mode
+                    if 'avoid_ens_run' in info_str: #
+                        debug_cfg['avoid_ens_run'] = (info_str.strip().split(' ')[-1] == 'yes')
+
+                    # when 'test_single_model' (boolean) = True, we run a single model, which is useful for testing
+                    # a simulator wrapper
+                    if 'test_single_model' in info_str:  #
+                        debug_cfg['test_single_model'] = (item.strip().split(' ')[-1] == 'yes')
+
+                print('debug_cfg = ', debug_cfg)
+                if debug_cfg['avoid_ens_run']:
+                    with np.load('test_init_en_pred.npz', allow_pickle=True) as f:
+                        en_pred = f['en_pred']
+                if debug_cfg['test_single_model']:
+                    if self.sim.redund_sim is not None:
+                        self.sim.redund_sim.setup_fwd_run()
+                    en_pred = self.sim.run_fwd_sim(enX[0], 0, del_folder=False)
             else:
-                en_pred = p_map(
-                    self.sim.run_fwd_sim, 
-                    enX,
-                    list(range(self.ne)), 
-                    num_cpus=nparallel, 
-                    disable=self.disable_tqdm,
-                    **progbar_settings
-                )
+                # No parralelization
+                if nparallel==1:
+                    en_pred = []
+                    pbar = tqdm(enumerate(enX), total=self.ne, **progbar_settings)
+                    for member_index, state in pbar:
+                        en_pred.append(deepcopy(self.sim.run_fwd_sim(state, member_index)))
+
+                # Parallelization on HPC using SLURM
+                elif self.sim.input_dict.get('hpc', False): # Run prediction in parallel on hpc
+                    en_pred = self.run_on_HPC(enX, batch_size=nparallel)
+
+                # Parallelization on local machine using p_map
+                else:
+                    en_pred = p_map(
+                        self.sim.run_fwd_sim,
+                        enX,
+                        list(range(len(enX))),
+                        num_cpus=nparallel,
+                        disable=self.disable_tqdm,
+                        **progbar_settings
+                    )
+
+                if self.iteration == 0 and ('debug_mode' in self.sim.input_dict):
+                    np.savez('test_init_en_pred.npz', **{'en_pred': en_pred})
+
             ######################################################################################################################
 
             # Convert state enemble back to matrix form

@@ -3,8 +3,12 @@
 import numpy as np
 from copy import deepcopy
 import copy as cp
+
+from pipt.misc_tools.analysis_tools import aug_state
 from scipy.linalg import solve, solve_banded, cholesky, lu_solve, lu_factor, inv
 import pickle
+
+import pipt.misc_tools.ensemble_tools as entools
 import pipt.misc_tools.analysis_tools as at
 from pipt.misc_tools.cov_regularization import _calc_loc
 
@@ -15,17 +19,29 @@ class rlmmac_update():
      minimum-average-cost problem: theory and applications." SPE Journal 2015: 962-982.
     """
 
-    def update(self):
-        # calc the svd of the scaled data pertubation matrix
-        u_d, s_d, v_d = np.linalg.svd(self.pert_preddata, full_matrices=False)
-        aug_state = at.aug_state(self.current_state, self.list_states, self.cell_index)
+    def update(self, enX, enY, enE, **kwargs):
 
+        # Scale and center the ensemble matrecies
+        #enYcentered = self.scale(np.dot(enY, self.proj), self.scale_data)
+
+        # enY[:, -1] => simulated data of mean moodel
+        enYcentered = self.scale( (enY[:, :self.ne] - enY[:, self.ne][:, None]) / np.sqrt(self.ne - 1), self.scale_data)
+
+        # calc the svd of the scaled data pertubation matrix
+        # u_d, s_d, v_d = np.linalg.svd(self.pert_preddata, full_matrices=False)
+        u_d, s_d, v_d = np.linalg.svd(enYcentered, full_matrices=False)
+
+        #aug_state = at.aug_state(self.current_state, self.list_states, self.cell_index)
+        aug_state = enX[:, 0:self.ne]
         # remove the last singular value/vector. This is because numpy returns all ne values, while the last is actually
         # zero. This part is a good place to include eventual additional truncation.
         if self.trunc_energy < 1:
             ti = (np.cumsum(s_d) / sum(s_d)) <= self.trunc_energy
             u_d, s_d, v_d = u_d[:, ti].copy(), s_d[ti].copy(), v_d[ti, :].copy()
+
         if 'localization' in self.keys_da:
+            loc_info = self.localization.loc_info
+
             if 'emp_cov' in self.keys_da and self.keys_da['emp_cov'] == 'yes':
                 if len(self.scale_data.shape) == 1:
                     E_hat = np.dot(np.expand_dims(self.scale_data ** (-1),
@@ -60,9 +76,9 @@ class rlmmac_update():
             data_size = [[self.obs_data[int(time)][data].size if self.obs_data[int(time)][data] is not None else 0
                           for data in self.list_datatypes] for time in self.assim_index[1]]
 
-            f = self.keys_da['localization']
+            #f = self.keys_da['localization']
 
-            if f[1][0] == 'autoadaloc':
+            if 'autoadaloc' in loc_info:
 
                 # Mean state and perturbation matrix
                 mean_state = np.mean(aug_state, 1)
@@ -70,19 +86,29 @@ class rlmmac_update():
                     pert_state = (self.state_scaling**(-1))[:, None] * (aug_state - np.dot(np.resize(mean_state, (len(mean_state), 1)),
                                                                                            np.ones((1, self.ne))))
                 else:
-                    pert_state = (self.state_scaling**(-1)
-                                  )[:, None] * np.dot(aug_state, self.proj)
+                    pert_state = (self.state_scaling**(-1))[:, None] * np.dot(aug_state, self.proj)
+
                 if len(self.scale_data.shape) == 1:
                     scaled_delta_data = np.dot(np.expand_dims(self.scale_data ** (-1), axis=1),
                                                np.ones((1, pert_state.shape[1]))) * (
-                        self.real_obs_data - self.aug_pred_data[:, 0:self.ne])
+                        self.vecObs[:,None] - enY[:, 0:self.ne])
                 else:
                     scaled_delta_data = solve(
-                        self.scale_data, (self.real_obs_data - self.aug_pred_data[:, 0:self.ne]))
+                        self.scale_data, (self.vecObs[:,None] - enY[:, 0:self.ne]))
 
-                self.step = self.localization.auto_ada_loc(self.state_scaling[:, None] * pert_state, np.dot(X, scaled_delta_data),
-                                                           self.list_states,
-                                                           **{'prior_info': self.prior_info})
+                if 'init_ens_only' in loc_info and loc_info['init_ens_only']:
+                    # Here we only use the initial ensemble to compute the tapering matrix, rather those
+                    # at each iteration step. In this case, there should be self.tapering_mix available
+                    assert hasattr(self,'tapering_mtx'), "Tapering matrix is not built yet"
+                    # "pert_state @ X" => Kalman-gain-like matrix.
+                    # Need to double check if scaled_delta_data is normalized by a square root of observation error Cov
+                    self.step =  ( self.tapering_mtx * (pert_state @ X) ) @ scaled_delta_data
+                else:
+                    self.step = self.localization.auto_ada_loc(self.state_scaling[:, None] * pert_state,
+                                                               np.dot(X, scaled_delta_data),
+                                                               self.list_states,
+                                                               **{'prior_info': self.prior_info})
+
             elif 'localanalysis' in self.localization.loc_info and self.localization.loc_info['localanalysis']:
                 if 'distance' in self.localization.loc_info:
                     weight = _calc_loc(self.localization.loc_info['range'], self.localization.loc_info['distance'],
@@ -101,10 +127,10 @@ class rlmmac_update():
                 if len(self.scale_data.shape) == 1:
                     scaled_delta_data = np.dot(np.expand_dims(self.scale_data ** (-1), axis=1),
                                                np.ones((1, pert_state.shape[1]))) * (
-                        self.real_obs_data - self.aug_pred_data)
+                        self.vecObs[:,None] - enY)
                 else:
                     scaled_delta_data = solve(
-                        self.scale_data, (self.real_obs_data - self.aug_pred_data))
+                        self.scale_data, (self.vecObs[:,None] - enY))
                 try:
                     self.step = weight.multiply(
                         np.dot(pert_state, X)).dot(scaled_delta_data)
@@ -126,10 +152,10 @@ class rlmmac_update():
                 if len(self.scale_data.shape) == 1:
                     scaled_delta_data = np.dot(np.expand_dims(self.scale_data ** (-1), axis=1),
                                                np.ones((1, pert_state.shape[1]))) * (
-                        self.real_obs_data - self.aug_pred_data)
+                        self.vecObs[:,None] - enY)
                 else:
                     scaled_delta_data = solve(
-                        self.scale_data, (self.real_obs_data - self.aug_pred_data))
+                        self.scale_data, (self.vecObs[:,None] - enY))
 
                 self.step = local_mask.multiply(
                     np.dot(pert_state, X)).dot(scaled_delta_data)
@@ -139,7 +165,7 @@ class rlmmac_update():
                 count = 0
                 for i in self.assim_index[1]:
                     for el in self.list_datatypes:
-                        if self.real_obs_data[int(i)][el] is not None:
+                        if self.vecObs[int(i)][el] is not None:
                             act_data_list[(
                                 el, float(self.keys_da['truedataindex'][int(i)]))] = count
                             count += 1
@@ -161,7 +187,7 @@ class rlmmac_update():
                     emp_cov = False
 
                 self.step = at.parallel_upd(self.list_states, self.prior_info, self.current_state, X,
-                                            self.localization.loc_info, self.real_obs_data, self.aug_pred_data,
+                                            self.localization.loc_info, self.vecObs, enY,
                                             int(self.keys_fwd['parallel']),
                                             actnum=self.localization.loc_info['actnum'],
                                             field_dim=self.localization.loc_info['field'],
@@ -189,13 +215,13 @@ class rlmmac_update():
                     Lam, z = np.linalg.eig(np.dot(x_0, x_0.T))
                     x_1 = np.dot(np.dot(u_d[:, :], np.dot(np.diag(s_d[:] ** (-1)).T, z)).T,
                                  np.dot(np.expand_dims(self.scale_data ** (-1), axis=1), np.ones((1, self.ne))) *
-                                 (self.real_obs_data - self.aug_pred_data))
+                                 (self.vecObs[:,None] - enY))
                 else:
                     E_hat = solve(self.scale_data, self.E)
                     x_0 = np.dot(np.diag(s_d[:] ** (-1)), np.dot(u_d[:, :].T, E_hat))
                     Lam, z = np.linalg.eig(np.dot(x_0, x_0.T))
                     x_1 = np.dot(np.dot(u_d[:, :], np.dot(np.diag(s_d[:] ** (-1)).T, z)).T,
-                                 solve(self.scale_data, (self.real_obs_data - self.aug_pred_data)))
+                                 solve(self.scale_data, (self.vecObs[:,None] - enY[:, 0:self.ne])))
 
                 x_2 = solve((self.lam + 1) * np.diag(Lam) + np.eye(len(Lam)), x_1)
                 x_3 = np.dot(np.dot(v_d.T, z), x_2)
@@ -205,10 +231,27 @@ class rlmmac_update():
                 # Compute the approximate update (follow notation in paper)
                 if len(self.scale_data.shape) == 1:
                     x_1 = np.dot(u_d.T, np.dot(np.expand_dims(self.scale_data ** (-1), axis=1), np.ones((1, self.ne))) *
-                                 (self.real_obs_data - self.aug_pred_data[:, 0:self.ne]))
+                                 (self.vecObs[:,None] - enY[:, 0:self.ne]))
                 else:
                     x_1 = np.dot(u_d.T, solve(self.scale_data,
-                                 (self.real_obs_data - self.aug_pred_data[:, 0:self.ne])))
+                                 (self.vecObs[:,None]- enY[:, 0:self.ne])))
                 x_2 = solve(((self.lam + 1) * np.eye(len(s_d)) + np.diag(s_d ** 2)), x_1)
                 x_3 = np.dot(np.dot(v_d.T, np.diag(s_d)), x_2)
                 self.step = np.dot(self.state_scaling[:, None] * pert_state, x_3)
+
+    def scale(self, data, scaling):
+        """
+        Scale the data perturbations by the data error standard deviation.
+
+        Args:
+            data (np.ndarray): data perturbations
+            scaling (np.ndarray): data error standard deviation
+
+        Returns:
+            np.ndarray: scaled data perturbations
+        """
+
+        if len(scaling.shape) == 1:
+            return (scaling ** (-1))[:, None] * data
+        else:
+            return solve(scaling, data)

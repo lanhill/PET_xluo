@@ -24,7 +24,6 @@ from pipt.misc_tools import analysis_tools as at
 import pipt.misc_tools.extract_tools as extract
 import pipt.misc_tools.ensemble_tools as entools
 
-
 class Assimilate:
     """
     Class for iterative ensemble-based methods. This loop is similar/equal to a deterministic/optimization loop, but
@@ -133,6 +132,26 @@ class Assimilate:
                     qaqc.calc_coverage()  # Compute data coverage
                     qaqc.calc_kg({'plot_all_kg': True, 'only_log': False, 'num_store': 5})  # Compute kalman gain
 
+                    # XLUO: Build a tapering matrix for AutoAdaLoc "auto_ada_loc" using the initial ensemble, which
+                    # may be used in all iteration steps of an IES. This represents a different way of using
+                    # correlation-based localizaton, see the discussion in
+                    # https://www.sciencedirect.com/science/article/pii/S0920410519309805
+                if ('localization' in self.ensemble.keys_da):
+                    loc_info = extract.list_to_dict(self.ensemble.keys_da['localization'])
+                    if ('load_existing_mtx' in loc_info) and loc_info['load_existing_mtx'] is not None:
+                        with np.load(loc_info['load_existing_mtx'], allow_pickle=True) as mtx:
+                            self.ensemble.tapering_mtx = mtx['tapering_mtx']
+                    else:
+                        if ('init_ens_only' in loc_info) and (loc_info['init_ens_only'].lower() == 'yes'):
+                            _, pred_data = at.aug_obs_pred_data(self.ensemble.obs_data, self.ensemble.pred_data,
+                                                                self.ensemble.assim_index, self.ensemble.list_datatypes)
+                            staticvar = self.ensemble.keys_da['staticvar'] if isinstance(self.ensemble.keys_da['staticvar'], list) else [self.ensemble.keys_da['staticvar']]
+                            _, self.ensemble.tapering_mtx = self.ensemble.localization.auto_ada_loc(self.ensemble.enX,
+                                                                                                    pred_data,
+                                                                                                    staticvar,
+                                                                                                    **{'prior_info': self.ensemble.prior_info, 'not_cal_step':True})
+                            np.savez(os.path.join(self.save_folder, 'tapering_mtx.npz'), **{'tapering_mtx': self.ensemble.tapering_mtx})
+
                 success_iter = True
 
                 # always store prior forcast, unless specifically told not to
@@ -172,9 +191,11 @@ class Assimilate:
                 if 'iterinfo' in self.ensemble.keys_da:
                     #
                     self._save_iteration_information()
+
+                if 'analysisdebug' in self.ensemble.keys_da:
+                    self._save_analysis_debug()
+
                 if self.ensemble.iteration > 0:
-                    if 'analysisdebug' in self.ensemble.keys_da:
-                        self._save_analysis_debug()
                     if 'qc' in self.ensemble.keys_da:  # Check if we want to perform a Quality Control of the updated state
                         # set updated prediction, state and lam
                         qaqc.set(

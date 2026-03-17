@@ -52,7 +52,7 @@ class GIESMixIn(Ensemble):
         `pipt.input_output.pipt_init.ReadInitFile`.
         """
         # Pass the init_file upwards in the hierarchy
-        super().__init__(keys_da, keys_fwd, sim)
+        super().__init__(keys_da, keys_en, sim)
 
         if self.restart is False:
             # Save prior state in separate variable
@@ -65,7 +65,7 @@ class GIESMixIn(Ensemble):
                 options = extract.list_to_dict(options)
 
             self.data_misfit_tol = options.get('data_misfit_tol', 0.01) # default value corresping to 1%
-            self.trunc_energy = options.get('energy', 0.95)
+            self.trunc_energy = options.get('trunc_energy', 0.95)
             self.step_tol = options.get('step_tol', 0.01)
             self.lam = options.get('lambda', 1.0)
             self.gamma = options.get('lambda_factor', 2.0)
@@ -154,7 +154,7 @@ class GIESMixIn(Ensemble):
 
             # Update the state ensemble and weights
             if hasattr(self, 'step'):
-                self.enX_temp = self.enX + self.step
+                self.enX_temp = self.enX[:, 0:self.ne] + self.step
             if hasattr(self, 'w_step'):
                 self.W = self.current_W + self.w_step
                 self.enX_temp = np.dot(self.prior_enX, (np.eye(self.ne) + self.W / np.sqrt(self.ne - 1)))
@@ -196,7 +196,8 @@ class GIESMixIn(Ensemble):
         # mat_obs = np.dot(obs_data_vector.reshape((len(obs_data_vector),1)), np.ones((1, self.ne))) # use the perturbed
         # data instead.
 
-        data_misfit = at.calc_objectivefun(self.enObs, enPred, self.cov_data)
+        #data_misfit = at.calc_objectivefun(self.enObs, enPred, self.cov_data)
+        data_misfit = at.calc_objectivefun(enPred[:, :self.ne], self.vecObs[:, None], self.cov_data)
 
         self.data_misfit = np.mean(data_misfit)
         self.data_misfit_std = np.std(data_misfit)
@@ -251,7 +252,7 @@ class GIESMixIn(Ensemble):
 
                 success = True
 
-                self.current_state = cp.deepcopy(self.state)
+                #self.current_state = cp.deepcopy(self.state)
 
                 # Update state ensemble
                 self.enX = cp.deepcopy(self.enX_temp)
