@@ -248,9 +248,11 @@ class Ensemble:
 
             # For RLM-MAC (or other GIES algorithm), one needs to simulate the mean
             # reservoir model
+            total_ne = self.ne
             if 'gies' in self.keys_en['daalg']:
                 enX_mean = np.mean(enX, axis=1)
                 enX = np.concatenate((enX, enX_mean[:, None]), axis=1)
+                total_ne += 1
 
             # Convert ensemble matrix to list of dictionaries
             enX = entools.matrix_to_list(enX, self.idX)
@@ -260,9 +262,10 @@ class Ensemble:
                     enX[n]['aux_input'] = self.aux_input[n]
 
             ######################################################################################################################
-            if 'debug_mode' in self.sim.input_dict:
+            debug_cfg = {'avoid_ens_run': False, 'test_single_model': False}
+            if ('debug_mode' in self.sim.input_dict) and self.iteration == 0:
                 assert isinstance(self.sim.input_dict['debug_mode'], list), "Error with the field of 'DEBUG_MODE' "
-                debug_cfg = dict()
+
                 for item in self.sim.input_dict['debug_mode']:  # if sim.input_dict['debug_mode'] contains a number of list items
                     info_str = item[0] if isinstance(item, list) else item  # extract information in string
 
@@ -285,7 +288,8 @@ class Ensemble:
                     if self.sim.redund_sim is not None:
                         self.sim.redund_sim.setup_fwd_run()
                     en_pred = self.sim.run_fwd_sim(enX[0], 0, del_folder=False)
-            else:
+
+            if not debug_cfg['avoid_ens_run']:
                 # No parralelization
                 if nparallel==1:
                     en_pred = []
@@ -302,7 +306,7 @@ class Ensemble:
                     en_pred = p_map(
                         self.sim.run_fwd_sim,
                         enX,
-                        list(range(len(enX))),
+                        list(range(total_ne)),
                         num_cpus=nparallel,
                         disable=self.disable_tqdm,
                         **progbar_settings
