@@ -287,13 +287,14 @@ class Ensemble:
                 if debug_cfg['test_single_model']:
                     if self.sim.redund_sim is not None:
                         self.sim.redund_sim.setup_fwd_run()
-                    en_pred = self.sim.run_fwd_sim(enX[0], 0, del_folder=False)
+                    en_pred = self.sim.run_fwd_sim(enX[65], 65, del_folder=False)
 
             if not debug_cfg['avoid_ens_run']:
                 # No parralelization
                 if nparallel==1:
                     en_pred = []
-                    pbar = tqdm(enumerate(enX), total=self.ne, **progbar_settings)
+                    pbar = tqdm(enumerate(enX), total=total_ne, **progbar_settings)
+
                     for member_index, state in pbar:
                         en_pred.append(deepcopy(self.sim.run_fwd_sim(state, member_index)))
 
